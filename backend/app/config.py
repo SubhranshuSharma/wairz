@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     uart_command_timeout: int = 30
     log_level: str = "INFO"
 
+    # LLM / Adapter config
+    model_backend: str = "claude"  # claude | openai | local-llama
+    openai_api_key: str = ""
+    openai_api_base: str = ""
+    openai_model: str = "gpt-3.5-turbo"
+    local_llm_url: str = ""  # e.g., http://local-llm:8080
+
 
 @lru_cache
 def get_settings() -> Settings:
