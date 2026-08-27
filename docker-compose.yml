@@ -1,114 +1,38 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: wairz
-      POSTGRES_PASSWORD: wairz
-      POSTGRES_DB: wairz
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wairz"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redisdata:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-      additional_contexts:
-        kernels: ./emulation/kernels
-      args:
-        DOCKER_GID: "${DOCKER_GID:-999}"
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://wairz:wairz@postgres:5432/wairz
-      REDIS_URL: redis://redis:6379/0
-      STORAGE_ROOT: /data/firmware
-      GHIDRA_INSTALL_DIR: /opt/ghidra
-      GHIDRA_SCRIPTS_PATH: /opt/ghidra_scripts
-      EMULATION_IMAGE: wairz-emulation
-      EMULATION_NETWORK: wairz_emulation_net
-      FUZZING_IMAGE: wairz-fuzzing
-      UART_BRIDGE_HOST: host.docker.internal
-      UART_BRIDGE_PORT: "9999"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - firmware_data:/data/firmware
-      - ./ghidra/scripts:/opt/ghidra_scripts:ro
-      - ./emulation/kernels:/opt/kernels:rw
-      - /var/run/docker.sock:/var/run/docker.sock
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-  emulation:
-    build:
-      context: ./emulation
-      dockerfile: Dockerfile
-    image: wairz-emulation
-    volumes:
-      - firmware_data:/data/firmware:ro
-      - ./emulation/kernels:/opt/kernels:ro
-    networks:
-      - default
-      - emulation_net
-    deploy:
-      resources:
-        limits:
-          memory: 1024M
-          cpus: "1.0"
-
-  fuzzing:
-    build:
-      context: ./fuzzing
-      dockerfile: Dockerfile
-    image: wairz-fuzzing
-    volumes:
-      - firmware_data:/data/firmware:ro
-    networks:
-      - default
-    deploy:
-      resources:
-        limits:
-          memory: 2048M
-          cpus: "2.0"
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
-
-volumes:
-  pgdata:
-  redisdata:
-  firmware_data:
-
-networks:
-  emulation_net:
-    internal: true
+@@
+   backend:
+@@
+     environment:
+@@
+       UART_BRIDGE_PORT: "9999"
++      # LLM configuration
++      MODEL_BACKEND: ${MODEL_BACKEND:-claude}        # claude | openai | local-llama
++      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-3.5-turbo}
++      OPENAI_API_BASE: ${OPENAI_API_BASE:-}
++      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://local-llm:8080}
+@@
+     depends_on:
+       postgres:
+         condition: service_healthy
+       redis:
+         condition: service_healthy
++
++# Optional local LLM service (commented out by default). Uncomment to enable.
++# Use a ggml/llama.cpp compatible server image that exposes an HTTP API. This
++# example uses text-generation-webui (oobabooga) which supports many backends
++# and can use CUDA when present. CPU-only operation works too (slower).
++#
++#  local-llm:
++#    image: ghcr.io/oobabooga/text-generation-webui:latest
++#    restart: unless-stopped
++#    ports:
++#      - "7860:7860"   # UI (optional)
++#      - "8080:8080"   # HTTP API used by the backend
++#    volumes:
++#      - ./models:/data/models
++#    environment:
++#      - TZ=UTC
++#    # For NVIDIA GPU hosts with NVIDIA Container Toolkit, add runtime/device access:
++#    #  runtime: nvidia
++#    #  environment:
++#    #    - NVIDIA_VISIBLE_DEVICES=all
++#    #    - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
