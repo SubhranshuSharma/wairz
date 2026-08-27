@@ -2,7 +2,7 @@
 
 This file is for AI agents (Claude Code, etc.) working on the Wairz codebase. It describes the architecture, conventions, and patterns you need to follow when making changes.
 
-**What is Wairz?** An open-source, browser-based firmware reverse engineering and security assessment platform. Users upload firmware, the tool unpacks it, and provides a unified interface for filesystem exploration, binary analysis, emulation, fuzzing, and security assessment — augmented by an AI assistant connected via MCP (Model Context Protocol). See `README.md` for user-facing documentation.
+**What is Wairz?** An open-source, browser-based firmware reverse engineering and security assessment platform. Users upload firmware, the tool unpacks it, and provides a unified interface for file inspection, static analysis, emulation, and automated security checks.
 
 ---
 
@@ -86,6 +86,139 @@ wairz/
 
 ---
 
+## LLM Integration — OpenAI (Codex/ChatGPT) & local llama.cpp (ggml)
+
+This branch (`feature/add-openai-llama-support`) includes adapters and wiring so the backend can use either an external OpenAI model (Codex/ChatGPT) or a local LLM server (llama.cpp / ggml via an HTTP server). The goal: boot the stack with Docker Compose and be able to call the configured model (OpenAI or local) from the backend immediately.
+
+What’s included on this branch
+- backend/app/ai/openai_adapter.py — OpenAI adapter (supports chat-style and legacy completion/Codex models)
+- backend/app/ai/llama_adapter.py — HTTP-first adapter for local model servers (tries common endpoints used by text-generation-webui / oobabooga)
+- backend/app/ai/adapter_manager.py — runtime chooser based on MODEL_BACKEND env var
+- backend/app/config.py — settings for MODEL_BACKEND, OPENAI_*, LOCAL_LLM_URL
+- docker-compose.yml — environment wiring and an optional (commented) local-llm service example
+- backend/pyproject.toml — openai python client added
+- A test endpoint to exercise the configured adapter: POST /api/v1/ai/test_generate (added to main)
+
+Quick design notes
+- The backend talks to the model via one of two adapters: OpenAI (remote, billable) or local-llm (HTTP server running in another container). This keeps the backend image small and avoids building large native LLM toolchains into the backend container.
+- Local model server is recommended to be run in a separate container (example: text-generation-webui / oobabooga). That container can be configured to use CUDA on GPU hosts or ggml/gguf CPU-only models on CPU-only hosts.
+- Security: API keys are not committed. Use .env for local testing or Docker secrets for production.
+
+Quickstart — make the branch self-contained and runnable
+
+1) Prepare environment file (.env)
+
+Create a .env file at the repo root (do NOT commit it). Minimum values for quick test using OpenAI:
+
+```env
+# Backend/database
+DATABASE_URL=postgresql+asyncpg://wairz:wairz@postgres:5432/wairz
+REDIS_URL=redis://redis:6379/0
+
+# LLM backend selection: claude | openai | local-llama
+MODEL_BACKEND=openai
+
+# OpenAI (if using OpenAI)
+OPENAI_API_KEY=sk_...   # put your key here
+OPENAI_MODEL=gpt-3.5-turbo
+OPENAI_API_BASE=
+
+# Local LLM (if using local-llama)
+#LOCAL_LLM_URL=http://local-llm:8080
+
+# Other defaults (keep existing values or adjust as needed)
+UART_BRIDGE_HOST=host.docker.internal
+UART_BRIDGE_PORT=9999
+STORAGE_ROOT=/data/firmware
+```
+
+2) Start required services (Postgres + Redis + Backend)
+
+- Build and start (OpenAI mode):
+
+```bash
+docker compose build backend
+docker compose up -d postgres redis backend
+```
+
+- Verify backend is running:
+
+```bash
+docker compose ps
+curl http://localhost:8000/health
+# -> {"status":"ok"}
+```
+
+3) Test the model adapter (OpenAI example)
+
+Call the test endpoint in the backend (the backend will forward to OpenAI):
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/ai/test_generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Write a one-line python program that prints Hello World","max_tokens":60}' | jq
+```
+
+If OPENAI_API_KEY is set and billing is active you should receive a short completion from the OpenAI model.
+
+4) Optional: Run a local llama.cpp-compatible server (CPU fallback / GPU preferred)
+
+If you prefer to run models locally (no external API calls), enable the optional `local-llm` service in docker-compose.yml (it is commented out by default). The example uses text-generation-webui (oobabooga) which exposes a simple HTTP API compatible with our adapter.
+
+- Steps:
+  1. Uncomment the `local-llm` service in docker-compose.yml (we included a commented example). This example maps `./models` on the host to `/data/models` in the container — place your ggml/gguf model files in `./models`.
+  2. Update your .env:
+
+```env
+MODEL_BACKEND=local-llama
+LOCAL_LLM_URL=http://local-llm:8080
+```
+
+  3. Start the local model service (first time may download dependencies in that container):
+
+```bash
+docker compose up -d local-llm
+```
+
+  4. Start the backend (or restart it so it picks up the env changes):
+
+```bash
+docker compose up -d --build backend
+```
+
+  5. Test the adapter with the same curl call to `/api/v1/ai/test_generate` — the backend will call the local LLM server.
+
+GPU notes
+- If you have an NVIDIA GPU and installed the NVIDIA Container Toolkit, configure the model container to access the GPU (example `runtime: nvidia` and `NVIDIA_VISIBLE_DEVICES=all`, `NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics`). The example local-llm service in docker-compose.yml includes commented guidance.
+- If no GPU is available the model container will run CPU-only and use ggml/gguf models — expect slower performance and high memory use for larger models.
+
+Security & cost warnings
+- OpenAI requests are billable. Do not send private firmware or secrets to OpenAI without explicit consent — prompts and content are transmitted to the provider.
+- Do NOT commit OPENAI_API_KEY or any secret to the repository. Use .env for local dev and Docker secrets for production.
+
+Adapter test endpoint (for quick verification)
+- POST /api/v1/ai/test_generate
+  - JSON body: {"prompt": "...", "max_tokens": 128, "temperature": 0.2}
+  - Returns: {"result": "..."} or {"error": "..."}
+
+Example:
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/ai/test_generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Say hello","max_tokens":40}' | jq
+```
+
+Troubleshooting
+- If the backend returns errors about the adapter:
+  - Confirm MODEL_BACKEND is set correctly in .env
+  - For openai: confirm OPENAI_API_KEY and OPENAI_MODEL are set and valid
+  - For local-llama: confirm LOCAL_LLM_URL matches the local model service address and that the model service is healthy
+- Inspect backend logs:
+  - docker compose logs -f backend
+
+---
+
 ## How to Add Things
 
 ### Adding a New MCP Tool
@@ -104,42 +237,15 @@ wairz/
    ```
 3. If it's a new category file, import and call `register_<category>_tools(registry)` in `backend/app/ai/__init__.py`.
 
-### Adding a New REST Endpoint
-
-1. Create router: `backend/app/routers/<name>.py`
-   ```python
-   router = APIRouter(prefix="/api/v1/projects/{project_id}/<name>", tags=["<name>"])
-   ```
-2. Register in `backend/app/main.py`: `app.include_router(<name>.router)`
-3. Create Pydantic schemas in `backend/app/schemas/<name>.py` (use `from_attributes=True` for ORM compatibility)
-4. Create service in `backend/app/services/<name>_service.py`
-
-### Adding a Database Table
-
-1. Create model in `backend/app/models/<name>.py`:
-   - Use SQLAlchemy `Mapped`/`mapped_column` style
-   - UUID primary key with dual defaults: `default=uuid.uuid4` + `server_default=func.gen_random_uuid()`
-   - Foreign keys with `cascade="all, delete-orphan"` on relationships
-2. Create Alembic migration: `alembic revision --autogenerate -m "description"`
-3. Migrations run automatically on container startup
-
-### Adding a Frontend Page
-
-1. Create page component in `frontend/src/pages/<Name>Page.tsx`
-2. Register route in `frontend/src/App.tsx`
-3. Create API client functions in `frontend/src/api/<name>.ts`
-4. Use Zustand stores (`frontend/src/stores/`) for shared state
-5. UI components from shadcn/ui + Tailwind
-
 ---
 
 ## Critical Rules
 
 ### Security
 
-1. **Path traversal prevention is mandatory.** Every file access must be validated via `app/utils/sandbox.py` (`os.path.realpath()` + prefix check against the extracted root). The MCP `ToolContext.resolve_path()` method handles this — always use it.
-2. **Never execute firmware binaries on the host.** Emulation runs inside an isolated QEMU Docker container. Fuzzing runs inside an isolated AFL++ Docker container. Both have resource limits (memory, CPU).
-3. **No API keys stored in the backend.** The Anthropic API key is user-provided via their Claude Code/Desktop configuration and never touches Wairz.
+1. **Path traversal prevention is mandatory.** Every file access must be validated via `app/utils/sandbox.py` (`os.path.realpath()` + prefix check against the extracted root). The MCP `ToolContext` helpers perform this validation — use them.
+2. **Never execute firmware binaries on the host.** Emulation runs inside an isolated QEMU Docker container. Fuzzing runs inside an isolated AFL++ Docker container. Both have resource limits (memory/cpu) and are isolated from the host.
+3. **No API keys stored in the backend.** The Anthropic/OpenAI API key should not be stored in the repository. Use .env for local dev and Docker secrets for production.
 
 ### Performance
 
@@ -149,92 +255,6 @@ wairz/
 4. **Truncate MCP tool outputs** — keep under 30KB (`app/utils/truncation.py`). Large outputs break MCP clients.
 5. **Firmware unpacking is non-blocking** — the unpack endpoint returns 202 and runs `asyncio.create_task()`. The frontend polls every 2s until status changes from "unpacking".
 
-### Conventions
-
-- **Backend:** Async everywhere (SQLAlchemy async sessions, `asyncio.create_subprocess_exec` for subprocesses). Use `async_session_factory` from `database.py` for DB access outside request context (e.g., background tasks).
-- **Frontend:** Zustand for state, API functions in `src/api/`, pages poll with `useEffect` + `setInterval` for long-running operations (see EmulationPage, FuzzingPage, ProjectDetailPage for the pattern).
-- **Docker:** Backend has access to Docker socket for managing emulation/fuzzing containers. Emulation containers run on an internal `emulation_net` network.
-
 ---
 
-## MCP Server
-
-Entry point: `wairz-mcp = "app.mcp_server:main"` (defined in `pyproject.toml`)
-
-The server uses a mutable `ProjectState` dataclass so all project context (project_id, firmware_id, extracted_path) can be switched dynamically via the `switch_project` tool without restarting the MCP process.
-
-### Tool Categories (60+)
-
-| Category | File | Tools |
-|----------|------|-------|
-| Project | `tools/filesystem.py` | `get_project_info`, `switch_project`, `list_projects` |
-| Filesystem | `tools/filesystem.py` | `list_directory`, `read_file`, `search_files`, `file_info`, `find_files_by_type`, `get_component_map`, `get_firmware_metadata`, `extract_bootloader_env` |
-| Strings | `tools/strings.py` | `extract_strings`, `search_strings`, `find_crypto_material`, `find_hardcoded_credentials` |
-| Binary | `tools/binary.py` | `list_functions`, `disassemble_function`, `decompile_function`, `list_imports`, `list_exports`, `xrefs_to`, `xrefs_from`, `get_binary_info`, `check_binary_protections`, `check_all_binary_protections`, `find_string_refs`, `resolve_import`, `find_callers`, `search_binary_content`, `get_stack_layout`, `get_global_layout`, `trace_dataflow`, `cross_binary_dataflow` |
-| Security | `tools/security.py` | `check_known_cves`, `analyze_config_security`, `check_setuid_binaries`, `analyze_init_scripts`, `check_filesystem_permissions`, `analyze_certificate` |
-| SBOM | `tools/sbom.py` | `generate_sbom`, `get_sbom_components`, `check_component_cves`, `run_vulnerability_scan` |
-| Emulation | `tools/emulation.py` | `start_emulation`, `run_command_in_emulation`, `stop_emulation`, `check_emulation_status`, `get_emulation_logs`, `enumerate_emulation_services`, `diagnose_emulation_environment`, `troubleshoot_emulation`, `get_crash_dump`, `run_gdb_command`, `save_emulation_preset`, `list_emulation_presets`, `start_emulation_from_preset` |
-| Fuzzing | `tools/fuzzing.py` | `analyze_fuzzing_target`, `generate_fuzzing_dictionary`, `generate_seed_corpus`, `generate_fuzzing_harness`, `start_fuzzing_campaign`, `check_fuzzing_status`, `stop_fuzzing_campaign`, `triage_fuzzing_crash`, `diagnose_fuzzing_campaign` |
-| Comparison | `tools/comparison.py` | `list_firmware_versions`, `diff_firmware`, `diff_binary`, `diff_decompilation` |
-| UART | `tools/uart.py` | `uart_connect`, `uart_send_command`, `uart_read`, `uart_send_break`, `uart_send_raw`, `uart_disconnect`, `uart_status`, `uart_get_transcript` |
-| Reporting | `tools/reporting.py` | `add_finding`, `list_findings`, `update_finding`, `read_project_instructions`, `list_project_documents`, `read_project_document` |
-| Code | `tools/documents.py` | `save_code_cleanup` |
-
----
-
-## UART Bridge Architecture
-
-The bridge runs on the host (not in Docker) because USB serial adapters can't easily pass through to containers.
-
-**How it works:**
-- **Host:** `scripts/wairz-uart-bridge.py` is a standalone TCP server (only requires pyserial). It listens on TCP 9999 and proxies serial I/O.
-- **Docker:** `uart_service.py` in the backend container connects to the bridge via `host.docker.internal:9999`
-- **Protocol:** Newline-delimited JSON, request/response matched by `id` field
-- **Important:** The bridge does NOT take a serial device path or baudrate on its command line. Those are specified by the MCP `uart_connect` tool at connection time.
-
-**Starting the bridge:**
-```bash
-python3 scripts/wairz-uart-bridge.py --bind 0.0.0.0 --port 9999
-```
-The bridge will print "UART bridge listening on ..." when ready. It waits for connection commands from the backend.
-
-**Connecting via MCP:** Call `uart_connect` with the `device_path` (e.g., `/dev/ttyUSB0`) and `baudrate` (e.g., 115200). The backend sends these to the bridge, which opens the serial port.
-
-**Common setup issues (Bridge unreachable):**
-1. `UART_BRIDGE_HOST` in `.env` must be `host.docker.internal` (NOT `localhost` — `localhost` inside Docker refers to the container, not the host)
-2. An iptables rule is required to allow Docker bridge traffic to reach the host:
-   ```bash
-   sudo iptables -I INPUT -i docker0 -p tcp --dport 9999 -j ACCEPT
-   ```
-3. After changing `.env`, restart the backend: `docker compose restart backend`
-4. After restarting the backend, reconnect MCP (e.g., `/mcp` in Claude Code)
-
----
-
-## Environment Variables
-
-See `.env.example` for defaults. Key variables:
-
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string (asyncpg) |
-| `REDIS_URL` | Redis connection string |
-| `STORAGE_ROOT` | Where firmware files are stored on disk |
-| `MAX_UPLOAD_SIZE_MB` | Maximum firmware upload size (default 500) |
-| `MAX_TOOL_OUTPUT_KB` | MCP tool output truncation limit (default 30) |
-| `GHIDRA_PATH` / `GHIDRA_SCRIPTS_PATH` | Ghidra headless installation paths |
-| `GHIDRA_TIMEOUT` | Decompilation timeout in seconds (default 120) |
-| `EMULATION_IMAGE` / `EMULATION_NETWORK` | Docker image and network for QEMU containers |
-| `FUZZING_IMAGE` / `FUZZING_TIMEOUT_MINUTES` | Docker image and timeout for AFL++ containers |
-| `UART_BRIDGE_HOST` / `UART_BRIDGE_PORT` | Host-side UART bridge connection |
-| `NVD_API_KEY` | Optional, for higher NVD rate limits during CVE scanning |
-
----
-
-## Testing Firmware
-
-Good images for development and testing:
-
-- **OpenWrt** (MIPS, ARM) — well-structured embedded Linux with lots of components
-- **DD-WRT** — similar to OpenWrt
-- **DVRF** (Damn Vulnerable Router Firmware) — intentionally vulnerable, great for security tool testing
+(End of file)
